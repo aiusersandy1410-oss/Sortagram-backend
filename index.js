@@ -194,4 +194,4 @@ app.post('/api/sync', requireAuth, async (req, res) => {
 });
 
 const port = process.env.PORT || 3001;
-app.listen(port, () => console.log(`Stashboard sync server on :${port}`));
+app.listen(port, () => console.log(`Sortagram-sync server on :${port}`));
