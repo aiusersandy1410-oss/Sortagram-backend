@@ -10,13 +10,13 @@ app.use(cors({ origin: process.env.CLIENT_ORIGIN }));
 
 const JWT_SECRET = process.env.JWT_SECRET;
 
-// ---------- sync-code auth (no third-party login, no cookies) ----------
-// Auth uses a bearer token in the Authorization header instead of a cookie.
-// Cookies don't work reliably here because the frontend (vercel.app) and
-// backend (railway.app) are different sites — many mobile browsers (and
-// especially in-app browsers like Instagram's) block that kind of
-// cross-site cookie by default for privacy, which silently broke sessions.
-// A token stored in localStorage and sent explicitly sidesteps that.
+// ---------- sync-code auth (no third-party login) ----------
+// Auth is a bearer JWT returned in the response body and sent back as
+// `Authorization: Bearer <token>` — never a cookie. The frontend and
+// backend live on different domains, and mobile in-app browsers (notably
+// Instagram's) routinely block cross-site cookies without warning, which
+// would silently break sessions. A token the client controls explicitly
+// sidesteps that entirely. See sync.js's `api()` helper for the client side.
 
 const WORDS = [
   'amber','birch','cedar','delta','ember','flint','glow','harbor','iris','jade',
@@ -28,8 +28,20 @@ function randomDigits(n){ return String(crypto.randomInt(10 ** n)).padStart(n, '
 function generateSyncCode(){
   return `${randomWord()}-${randomWord()}-${randomDigits(4)}`;
 }
+
 function issueToken(userId){
   return jwt.sign({ uid: userId }, JWT_SECRET, { expiresIn: '365d' });
+}
+
+// Converts an epoch-millisecond number (what the client's Date.now() produces)
+// into an ISO string Postgres will accept for a TIMESTAMPTZ column. Binding
+// the raw number directly fails with "invalid input syntax for type
+// timestamp with time zone" — pg does not coerce bare numbers for you.
+// null/undefined pass through as null (e.g. an item that was never deleted).
+function toTimestamp(ms){
+  if (ms === null || ms === undefined || ms === '') return null;
+  const d = new Date(Number(ms));
+  return isNaN(d.getTime()) ? null : d.toISOString();
 }
 
 // Starts sync on this device: creates a brand-new account and its sync code.
@@ -38,6 +50,7 @@ function issueToken(userId){
 app.post('/auth/start', async (req, res) => {
   try {
     let code, inserted;
+    // Extremely unlikely to collide, but retry once if it does.
     for (let attempt = 0; attempt < 3 && !inserted; attempt++) {
       code = generateSyncCode();
       try {
@@ -72,6 +85,13 @@ app.post('/auth/join', async (req, res) => {
   }
 });
 
+// JWTs here are stateless (no server-side session row to revoke), so there is
+// nothing to invalidate on this end. Kept as a no-op endpoint in case a future
+// client calls it; today's sync.js just drops the local token and never hits this.
+app.post('/auth/logout', (req, res) => {
+  res.json({ ok: true });
+});
+
 function requireAuth(req, res, next) {
   const header = req.headers.authorization || '';
   const token = header.startsWith('Bearer ') ? header.slice(7) : null;
@@ -84,7 +104,8 @@ function requireAuth(req, res, next) {
   }
 }
 
-// Lets the client resume a session on page load and re-display the sync code.
+// Lets the client resume a session on page load and re-display the sync code
+// (e.g. so "Manage sync" can show it again without the person re-copying it).
 app.get('/auth/me', requireAuth, async (req, res) => {
   const { rows } = await pool.query(`SELECT sync_code AS "syncCode" FROM users WHERE id = $1`, [req.userId]);
   if (!rows[0]) return res.status(404).json({ error: 'User not found' });
@@ -96,7 +117,8 @@ app.get('/auth/me', requireAuth, async (req, res) => {
 app.get('/api/sync', requireAuth, async (req, res) => {
   const since = req.query.since || '1970-01-01T00:00:00Z';
   const topics = await pool.query(
-    `SELECT id, name, color_index AS "colorIndex", is_creator AS "isCreator", updated_at AS "updatedAt", deleted_at AS "deletedAt"
+    `SELECT id, name, color_index AS "colorIndex", is_creator AS "isCreator",
+            updated_at AS "updatedAt", deleted_at AS "deletedAt"
      FROM topics WHERE user_id = $1 AND updated_at > $2`,
     [req.userId, since]
   );
@@ -111,12 +133,6 @@ app.get('/api/sync', requireAuth, async (req, res) => {
 
 // Push: client sends changed topics/items since its last sync.
 // Last-write-wins: a record is only rejected if the server's copy is strictly newer.
-//
-// The client stores timestamps as plain epoch-ms numbers (Date.now()), but
-// these columns are TIMESTAMPTZ — binding a raw number directly causes
-// Postgres to reject the insert. Convert to a real Date first.
-function toTimestamp(v){ return v ? new Date(v) : null; }
-
 app.post('/api/sync', requireAuth, async (req, res) => {
   const { topics = [], items = [] } = req.body;
   const rejected = { topics: [], items: [] };
@@ -125,6 +141,10 @@ app.post('/api/sync', requireAuth, async (req, res) => {
     await client.query('BEGIN');
 
     for (const t of topics) {
+      // Guard against malformed queued records (e.g. a pre-migration record
+      // missing a name) — one bad row shouldn't 500 the whole batch and
+      // leave every other pending change permanently stuck retrying.
+      if (!t || !t.id || !t.name) { rejected.topics.push(t && t.id); continue; }
       const { rows } = await client.query(
         `SELECT updated_at FROM topics WHERE user_id = $1 AND id = $2`,
         [req.userId, t.id]
@@ -143,6 +163,7 @@ app.post('/api/sync', requireAuth, async (req, res) => {
     }
 
     for (const i of items) {
+      if (!i || !i.id) { rejected.items.push(i && i.id); continue; }
       const { rows } = await client.query(
         `SELECT updated_at FROM items WHERE user_id = $1 AND id = $2`,
         [req.userId, i.id]
@@ -160,7 +181,6 @@ app.post('/api/sync', requireAuth, async (req, res) => {
          JSON.stringify(i.topicIds || []), toTimestamp(i.createdAt), toTimestamp(i.updatedAt), toTimestamp(i.deletedAt)]
       );
     }
-
 
     await client.query('COMMIT');
     res.json({ ok: true, rejected, syncedAt: new Date().toISOString() });
