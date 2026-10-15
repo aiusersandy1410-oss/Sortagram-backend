@@ -3,6 +3,7 @@ const jwt = require('jsonwebtoken');
 const cors = require('cors');
 const crypto = require('crypto');
 const { pool } = require('./db');
+const linkInfo = require('./linkinfo');
 
 const JWT_SECRET = process.env.JWT_SECRET;
 if (!JWT_SECRET) { console.error('JWT_SECRET is not set'); process.exit(1); }
@@ -190,6 +191,40 @@ app.post('/api/sync', requireAuth, wrap(async (req, res) => {
     throw err;
   } finally {
     client.release();
+  }
+}));
+
+// ---------- link auto-fill (Gemini) ----------
+// Needs GEMINI_API_KEY on Render. The key never leaves the server.
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+let aiClient = null;
+async function getAi() {
+  if (!process.env.GEMINI_API_KEY) return null;
+  if (!aiClient) {
+    const { GoogleGenAI } = await import('@google/genai'); // ESM-only package, loaded from CommonJS
+    aiClient = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+  }
+  return aiClient;
+}
+
+app.post('/api/link-info', requireAuth, wrap(async (req, res) => {
+  if (limited('li:' + req.userId, 40, 3600000)) return res.status(429).json({ error: 'Auto-fill limit reached for now. Try again in an hour.' });
+  const url = linkInfo.validateUrl(req.body.url);
+  if (!url) return res.status(400).json({ error: 'That doesn\u2019t look like a web link' });
+  const ai = await getAi();
+  if (!ai) return res.status(503).json({ error: 'Link auto-fill isn\u2019t set up on the server yet' });
+  const existingTopics = (Array.isArray(req.body.existingTopics) ? req.body.existingTopics : [])
+    .filter((t) => typeof t === 'string').map((t) => t.trim().slice(0, 30)).filter(Boolean).slice(0, 100);
+  try {
+    const data = await linkInfo.analyzeLink({ ai, model: GEMINI_MODEL, url, existingTopics });
+    if (!data) return res.json({ ok: false, reason: 'unreadable' });
+    res.json({ ok: true, data });
+  } catch (e) {
+    if (e && (e.status === 429 || /\b429\b|RESOURCE_EXHAUSTED/.test(String(e.message)))) {
+      return res.status(429).json({ error: 'Auto-fill is busy. Try again in a minute.' });
+    }
+    console.error('link-info failed:', e && e.message);
+    res.json({ ok: false, reason: 'error' });
   }
 }));
 
