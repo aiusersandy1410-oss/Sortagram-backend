@@ -50,7 +50,10 @@ const Sync = (function () {
     if (res.status === 401 && authToken) { user = null; setToken(null); stopPeriodicSync(); emit('stash-sync-changed'); }
     if (!res.ok) {
       const body = await res.json().catch(() => ({}));
-      throw new Error(body.error || ('Request failed: ' + res.status));
+      const err = new Error(body.error || ('Request failed: ' + res.status));
+      err.status = res.status;
+      err.code = body.code;   // e.g. 'limit' when the daily auto-fill allowance is used up
+      throw err;
     }
     return res.json();
   }
@@ -381,8 +384,19 @@ const Sync = (function () {
     return api('/api/link-info', { method: 'POST', body: JSON.stringify({ url, existingTopics: topicNames || [] }) });
   }
 
+  // Several links in one request (the server accepts up to 10).
+  function linkInfoBatch(urls, topicNames) {
+    if (!authToken) return Promise.reject(new Error('Turn on sync to use auto-fill'));
+    return api('/api/link-info/batch', { method: 'POST', body: JSON.stringify({ urls, existingTopics: topicNames || [] }) });
+  }
+  // { enabled, used, limit, remaining } for today.
+  function aiStatus() {
+    if (!authToken) return Promise.reject(new Error('Sync is off'));
+    return api('/api/ai-status');
+  }
+
   return {
-    init, openPanel, linkInfo, signOut: turnOffSync, queueChange, queueChanges, pushSoon,
+    init, openPanel, linkInfo, linkInfoBatch, aiStatus, signOut: turnOffSync, queueChange, queueChanges, pushSoon,
     get user() { return user; },
     get hasToken() { return !!authToken; },
     _test: { mergeIncoming, normItem, normTopic, dedupeTopics, getPending }

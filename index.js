@@ -41,6 +41,8 @@ async function ensureSchema() {
     // Older schemas had these columns as NOT NULL; the client no longer sends them.
     `ALTER TABLE topics ALTER COLUMN color DROP NOT NULL`,
     `ALTER TABLE topics ALTER COLUMN sort_order DROP NOT NULL`,
+    `CREATE TABLE IF NOT EXISTS ai_usage (
+       user_id INTEGER NOT NULL, day DATE NOT NULL, n INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (user_id, day))`,
     `CREATE INDEX IF NOT EXISTS topics_user_sync ON topics (user_id, server_updated_at)`,
     `CREATE INDEX IF NOT EXISTS items_user_sync ON items (user_id, server_updated_at)`
   ];
@@ -210,23 +212,79 @@ async function getAi() {
   return aiClient;
 }
 
+// ---- daily allowance (stored in Postgres, so reloading the page or a server restart can't reset it) ----
+// Counts links read per user per UTC day. Set AI_DAILY_LIMIT on Render to change it.
+const AI_DAILY_LIMIT = Math.max(1, parseInt(process.env.AI_DAILY_LIMIT, 10) || 200);
+const TODAY = "(now() AT TIME ZONE 'UTC')::date";
+
+async function aiUsed(userId) {
+  try {
+    const { rows } = await pool.query(`SELECT n FROM ai_usage WHERE user_id = $1 AND day = ${TODAY}`, [userId]);
+    return rows[0] ? rows[0].n : 0;
+  } catch (e) { console.warn('ai_usage read failed:', e.message); return 0; }
+}
+// Reserves `count` links atomically; false when that would pass the daily limit. Fails open if the table is unavailable.
+async function aiConsume(userId, count) {
+  if (count > AI_DAILY_LIMIT) return false;
+  try {
+    const { rowCount } = await pool.query(
+      `INSERT INTO ai_usage (user_id, day, n) VALUES ($1, ${TODAY}, $2)
+       ON CONFLICT (user_id, day) DO UPDATE SET n = ai_usage.n + EXCLUDED.n
+       WHERE ai_usage.n + EXCLUDED.n <= $3`, [userId, count, AI_DAILY_LIMIT]);
+    return rowCount === 1;
+  } catch (e) { console.warn('ai_usage write failed (allowing):', e.message); return true; }
+}
+async function aiRefund(userId, count) {
+  try { await pool.query(`UPDATE ai_usage SET n = GREATEST(n - $2, 0) WHERE user_id = $1 AND day = ${TODAY}`, [userId, count]); }
+  catch (e) { /* best effort */ }
+}
+const limitReply = (res, msg) => res.status(429).json({ code: 'limit', error: msg });
+const isGeminiLimit = (e) => e && (e.status === 429 || /\b429\b|RESOURCE_EXHAUSTED/.test(String(e.message || '')));
+const cleanTopicNames = (list) => (Array.isArray(list) ? list : [])
+  .filter((t) => typeof t === 'string').map((t) => t.trim().slice(0, 30)).filter(Boolean).slice(0, 100);
+
+// Lets the app know up front whether auto-fill is available, so it can show the manual form straight away.
+app.get('/api/ai-status', requireAuth, wrap(async (req, res) => {
+  const used = await aiUsed(req.userId);
+  res.json({ enabled: !!process.env.GEMINI_API_KEY, used, limit: AI_DAILY_LIMIT, remaining: Math.max(0, AI_DAILY_LIMIT - used) });
+}));
+
+// One link (used when saving a single item).
 app.post('/api/link-info', requireAuth, wrap(async (req, res) => {
-  if (limited('li:' + req.userId, 150, 3600000)) return res.status(429).json({ error: 'Auto-fill limit reached for now. Try again in an hour.' });
   const url = linkInfo.validateUrl(req.body.url);
   if (!url) return res.status(400).json({ error: 'That doesn\u2019t look like a web link' });
   const ai = await getAi();
-  if (!ai) return res.status(503).json({ error: 'Link auto-fill isn\u2019t set up on the server yet' });
-  const existingTopics = (Array.isArray(req.body.existingTopics) ? req.body.existingTopics : [])
-    .filter((t) => typeof t === 'string').map((t) => t.trim().slice(0, 30)).filter(Boolean).slice(0, 100);
+  if (!ai) return res.status(503).json({ code: 'unavailable', error: 'Link auto-fill isn\u2019t set up on the server yet' });
+  if (!(await aiConsume(req.userId, 1))) return limitReply(res, 'Today\u2019s auto-fill limit is reached. It resets at midnight UTC.');
   try {
-    const data = await linkInfo.analyzeWithModels({ ai, models: GEMINI_MODELS, url, existingTopics });
+    const data = await linkInfo.analyzeWithModels({ ai, models: GEMINI_MODELS, url, existingTopics: cleanTopicNames(req.body.existingTopics) });
     if (!data) return res.json({ ok: false, reason: 'unreadable' });
     res.json({ ok: true, data });
   } catch (e) {
-    if (e && (e.status === 429 || /\b429\b|RESOURCE_EXHAUSTED/.test(String(e.message)))) {
-      return res.status(429).json({ error: 'Auto-fill is busy. Try again in a minute.' });
-    }
+    await aiRefund(req.userId, 1);
+    if (isGeminiLimit(e)) return limitReply(res, 'Gemini\u2019s limit was reached for now. Try again later.');
     console.error('link-info failed:', e && e.status, e && e.message);
+    res.json({ ok: false, reason: 'error', hint: linkInfo.describeError(e) });
+  }
+}));
+
+// Several links in one go (used by "Auto-sort with AI"): up to 10 per request.
+app.post('/api/link-info/batch', requireAuth, wrap(async (req, res) => {
+  const rawUrls = Array.isArray(req.body.urls) ? req.body.urls : [];
+  const urls = rawUrls.map((u) => linkInfo.validateUrl(u));
+  if (!urls.length || urls.length > 10 || urls.some((u) => !u)) return res.status(400).json({ error: 'Send between 1 and 10 valid web links' });
+  const ai = await getAi();
+  if (!ai) return res.status(503).json({ code: 'unavailable', error: 'Link auto-fill isn\u2019t set up on the server yet' });
+  if (!(await aiConsume(req.userId, urls.length))) return limitReply(res, 'Today\u2019s auto-fill limit is reached. It resets at midnight UTC.');
+  try {
+    const results = await linkInfo.analyzeBatchWithModels({ ai, models: GEMINI_MODELS, urls, existingTopics: cleanTopicNames(req.body.existingTopics) });
+    const unreadable = results.filter((r) => !r).length;
+    if (unreadable) await aiRefund(req.userId, unreadable); // pages Gemini couldn't read don't use up the allowance
+    res.json({ ok: true, results: results.map((data, i) => (data ? { url: rawUrls[i], ok: true, data } : { url: rawUrls[i], ok: false })) });
+  } catch (e) {
+    await aiRefund(req.userId, urls.length);
+    if (isGeminiLimit(e)) return limitReply(res, 'Gemini\u2019s limit was reached for now. Try again later.');
+    console.error('link-info batch failed:', e && e.status, e && e.message);
     res.json({ ok: false, reason: 'error', hint: linkInfo.describeError(e) });
   }
 }));
