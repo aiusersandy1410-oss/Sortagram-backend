@@ -115,4 +115,26 @@ async function analyzeLink({ ai, model, url, existingTopics = [], timeoutMs = 25
   return null; // Gemini answered but could not read the page
 }
 
-module.exports = { analyzeLink, validateUrl, sanitize, parseJson, buildPrompt };
+// A retired model answers 404 "no longer available". Try the next model instead of failing.
+const isModelGone = (e) => !!e && (e.status === 404 || /no longer available|NOT_FOUND|is not found for API version/i.test(String(e.message || '')));
+
+async function analyzeWithModels({ models, ...rest }) {
+  let last = null;
+  for (const model of models) {
+    try { return await analyzeLink({ ...rest, model }); }
+    catch (e) { if (isModelGone(e)) { last = e; continue; } throw e; }
+  }
+  throw last || new Error('No Gemini model configured');
+}
+
+// Short, safe category for the app to explain what went wrong (never includes secrets).
+function describeError(e) {
+  const msg = String((e && e.message) || '');
+  if (isRateLimit(e)) return 'busy';
+  if (isModelGone(e)) return 'model';
+  if (e && (e.status === 401 || e.status === 403) || /API key|API_KEY_INVALID|PERMISSION_DENIED|UNAUTHENTICATED/i.test(msg)) return 'key';
+  if (/timed out/i.test(msg)) return 'timeout';
+  return 'error';
+}
+
+module.exports = { analyzeWithModels, describeError, isModelGone, analyzeLink, validateUrl, sanitize, parseJson, buildPrompt };

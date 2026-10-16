@@ -196,7 +196,10 @@ app.post('/api/sync', requireAuth, wrap(async (req, res) => {
 
 // ---------- link auto-fill (Gemini) ----------
 // Needs GEMINI_API_KEY on Render. The key never leaves the server.
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+// gemini-2.5-flash was retired on 16 Oct 2026. Set GEMINI_MODEL on Render to change the first choice;
+// if a model is gone the server automatically tries the next one.
+const GEMINI_MODELS = [process.env.GEMINI_MODEL || 'gemini-3.5-flash', 'gemini-3-flash-preview']
+  .filter((m, i, a) => m && a.indexOf(m) === i);
 let aiClient = null;
 async function getAi() {
   if (!process.env.GEMINI_API_KEY) return null;
@@ -208,7 +211,7 @@ async function getAi() {
 }
 
 app.post('/api/link-info', requireAuth, wrap(async (req, res) => {
-  if (limited('li:' + req.userId, 40, 3600000)) return res.status(429).json({ error: 'Auto-fill limit reached for now. Try again in an hour.' });
+  if (limited('li:' + req.userId, 150, 3600000)) return res.status(429).json({ error: 'Auto-fill limit reached for now. Try again in an hour.' });
   const url = linkInfo.validateUrl(req.body.url);
   if (!url) return res.status(400).json({ error: 'That doesn\u2019t look like a web link' });
   const ai = await getAi();
@@ -216,15 +219,15 @@ app.post('/api/link-info', requireAuth, wrap(async (req, res) => {
   const existingTopics = (Array.isArray(req.body.existingTopics) ? req.body.existingTopics : [])
     .filter((t) => typeof t === 'string').map((t) => t.trim().slice(0, 30)).filter(Boolean).slice(0, 100);
   try {
-    const data = await linkInfo.analyzeLink({ ai, model: GEMINI_MODEL, url, existingTopics });
+    const data = await linkInfo.analyzeWithModels({ ai, models: GEMINI_MODELS, url, existingTopics });
     if (!data) return res.json({ ok: false, reason: 'unreadable' });
     res.json({ ok: true, data });
   } catch (e) {
     if (e && (e.status === 429 || /\b429\b|RESOURCE_EXHAUSTED/.test(String(e.message)))) {
       return res.status(429).json({ error: 'Auto-fill is busy. Try again in a minute.' });
     }
-    console.error('link-info failed:', e && e.message);
-    res.json({ ok: false, reason: 'error' });
+    console.error('link-info failed:', e && e.status, e && e.message);
+    res.json({ ok: false, reason: 'error', hint: linkInfo.describeError(e) });
   }
 }));
 
