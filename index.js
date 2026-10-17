@@ -95,6 +95,9 @@ function requireAuth(req, res, next) {
 // ---------- routes ----------
 app.get('/health', (req, res) => res.json({ ok: true }));
 
+// The API has nothing for search engines to index.
+app.get('/robots.txt', (req, res) => res.type('text/plain').send('User-agent: *\nDisallow: /\n'));
+
 app.post('/auth/start', wrap(async (req, res) => {
   if (limited('start:' + req.ip, 20, 3600000)) return res.status(429).json({ error: 'Too many attempts, try again later' });
   let code, user;
@@ -198,9 +201,10 @@ app.post('/api/sync', requireAuth, wrap(async (req, res) => {
 
 // ---------- link auto-fill (Gemini) ----------
 // Needs GEMINI_API_KEY on Render. The key never leaves the server.
-// gemini-2.5-flash was retired on 16 Oct 2026. Set GEMINI_MODEL on Render to change the first choice;
-// if a model is gone the server automatically tries the next one.
-const GEMINI_MODELS = [process.env.GEMINI_MODEL || 'gemini-3.5-flash', 'gemini-3-flash-preview']
+// Google's current generally-available Flash model is gemini-3.8-flash; gemini-3.7-flash stays supported and
+// gemini-3.5-flash is deprecated but still routed. If a model is ever retired (404), the next one is tried
+// automatically. Set GEMINI_MODEL on Render to change the first choice without touching code.
+const GEMINI_MODELS = [process.env.GEMINI_MODEL || 'gemini-3.8-flash', 'gemini-3.7-flash', 'gemini-3.5-flash']
   .filter((m, i, a) => m && a.indexOf(m) === i);
 let aiClient = null;
 async function getAi() {
