@@ -261,7 +261,7 @@ app.post('/api/link-info', requireAuth, wrap(async (req, res) => {
   if (!ai) return res.status(503).json({ code: 'unavailable', error: 'Link auto-fill isn\u2019t set up on the server yet' });
   if (!(await aiConsume(req.userId, 1))) return limitReply(res, 'Today\u2019s auto-fill limit is reached. It resets at midnight UTC.');
   try {
-    const data = await linkInfo.analyzeWithModels({ ai, models: GEMINI_MODELS, url, existingTopics: cleanTopicNames(req.body.existingTopics) });
+    const [data] = await linkInfo.analyzeLinks({ ai, models: GEMINI_MODELS, urls: [url], existingTopics: cleanTopicNames(req.body.existingTopics) });
     if (!data) return res.json({ ok: false, reason: 'unreadable' });
     res.json({ ok: true, data });
   } catch (e) {
@@ -281,7 +281,7 @@ app.post('/api/link-info/batch', requireAuth, wrap(async (req, res) => {
   if (!ai) return res.status(503).json({ code: 'unavailable', error: 'Link auto-fill isn\u2019t set up on the server yet' });
   if (!(await aiConsume(req.userId, urls.length))) return limitReply(res, 'Today\u2019s auto-fill limit is reached. It resets at midnight UTC.');
   try {
-    const results = await linkInfo.analyzeBatchWithModels({ ai, models: GEMINI_MODELS, urls, existingTopics: cleanTopicNames(req.body.existingTopics) });
+    const results = await linkInfo.analyzeLinks({ ai, models: GEMINI_MODELS, urls, existingTopics: cleanTopicNames(req.body.existingTopics) });
     const unreadable = results.filter((r) => !r).length;
     if (unreadable) await aiRefund(req.userId, unreadable); // pages Gemini couldn't read don't use up the allowance
     res.json({ ok: true, results: results.map((data, i) => (data ? { url: rawUrls[i], ok: true, data } : { url: rawUrls[i], ok: false })) });
