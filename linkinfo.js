@@ -332,8 +332,22 @@ async function analyzeLinks({ ai, models, urls, existingTopics = [], fetchImpl }
   return out;                                                // partial failure: those links simply stay unread
 }
 
+// Asks Google which Flash models exist right now, newest first (e.g. ["gemini-3.8-flash", "gemini-3.7-flash"]).
+// Used only when the configured models have all been retired.
+async function discoverFlashModels(ai) {
+  const found = [];
+  const pager = await ai.models.list();
+  for await (const m of pager) {
+    const name = String((m && m.name) || '').replace(/^models\//, '');
+    const actions = (m && (m.supportedActions || m.supported_actions || m.supportedGenerationMethods)) || [];
+    if (/^gemini-\d+(\.\d+)?-flash$/.test(name) && (!actions.length || actions.includes('generateContent'))) found.push(name);
+  }
+  const ver = (n) => n.replace(/^gemini-/, '').replace(/-flash$/, '').split('.').map(Number);
+  return found.sort((a, b) => { const x = ver(a), y = ver(b); return (y[0] - x[0]) || ((y[1] || 0) - (x[1] || 0)); });
+}
+
 module.exports = {
-  analyzeLinks, fetchOEmbed, oembedEndpoint, analyzeMetaBatch,
+  discoverFlashModels, analyzeLinks, fetchOEmbed, oembedEndpoint, analyzeMetaBatch,
   analyzeBatchWithModels, analyzeBatch, matchBatch, parseJsonArray, buildBatchPrompt,
   analyzeWithModels, describeError, isModelGone, analyzeLink, validateUrl, sanitize, parseJson, buildPrompt
 };

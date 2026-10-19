@@ -4,6 +4,7 @@ const cors = require('cors');
 const crypto = require('crypto');
 const { pool } = require('./db');
 const linkInfo = require('./linkinfo');
+const selfHeal = require('./selfheal');
 
 const JWT_SECRET = process.env.JWT_SECRET;
 if (!JWT_SECRET) { console.error('JWT_SECRET is not set'); process.exit(1); }
@@ -15,6 +16,9 @@ app.use(express.json({ limit: '2mb' }));
 // Auth is a bearer token (Authorization header), not a cookie, so no credentials mode is needed.
 const origins = (process.env.CLIENT_ORIGIN || '').split(',').map(s => s.trim()).filter(Boolean);
 app.use(cors({ origin: origins.length ? origins : true }));
+
+// A crash in one background promise must not take the whole server down.
+process.on('unhandledRejection', (e) => console.error('Unhandled rejection:', e && e.message));
 
 const wrap = (fn) => (req, res) => fn(req, res).catch((err) => {
   console.error(err);
@@ -46,10 +50,26 @@ async function ensureSchema() {
     `CREATE INDEX IF NOT EXISTS topics_user_sync ON topics (user_id, server_updated_at)`,
     `CREATE INDEX IF NOT EXISTS items_user_sync ON items (user_id, server_updated_at)`
   ];
+  let unreachable = false;
   for (const s of stmts) {
     try { await pool.query(s); }
-    catch (e) { console.warn('schema step skipped:', s.slice(0, 50).replace(/\s+/g, ' '), '-', e.message); }
+    catch (e) {
+      if (/ECONN|ETIMEDOUT|terminat|connection|57P0|08\d{3}/i.test(String(e.code || '') + ' ' + e.message)) unreachable = true;
+      console.warn('schema step skipped:', s.slice(0, 50).replace(/\s+/g, ' '), '-', e.message);
+    }
   }
+  return !unreachable;
+}
+
+// A sleeping or restarting database makes setup fail at boot. Instead of staying half-configured, retry in the background.
+async function ensureSchemaWithRetry() {
+  for (let i = 0; i < 6; i++) {
+    if (await ensureSchema()) return true;
+    const wait = Math.min(5000 * (i + 1), 30000);
+    console.warn(`Database not reachable yet; retrying schema setup in ${wait / 1000}s`);
+    await new Promise((r) => setTimeout(r, wait));
+  }
+  return false;
 }
 
 // ---------- helpers ----------
@@ -93,7 +113,15 @@ function requireAuth(req, res, next) {
 }
 
 // ---------- routes ----------
-app.get('/health', (req, res) => res.json({ ok: true }));
+// Always answers ok (so uptime pings never restart the server); `db` says whether Postgres answered, which also wakes a sleeping one.
+app.get('/health', async (req, res) => {
+  let db = false;
+  try {
+    await Promise.race([pool.query('SELECT 1'), new Promise((_, rej) => setTimeout(() => rej(new Error('db timeout')), 3000))]);
+    db = true;
+  } catch (e) { /* reported below */ }
+  res.json({ ok: true, db, version: '2.1', features: ['batch', 'ai-status', 'self-heal'] });
+});
 
 // The API has nothing for search engines to index.
 app.get('/robots.txt', (req, res) => res.type('text/plain').send('User-agent: *\nDisallow: /\n'));
@@ -216,6 +244,13 @@ async function getAi() {
   return aiClient;
 }
 
+const modelHealer = selfHeal.createModelHealer({
+  initialModels: GEMINI_MODELS,
+  isModelGone: linkInfo.isModelGone,
+  discover: async () => { const ai = await getAi(); return ai ? linkInfo.discoverFlashModels(ai) : []; }
+});
+const geminiBreaker = selfHeal.createBreaker({ threshold: 3, cooldownMs: 60000 });
+
 // ---- daily allowance (stored in Postgres, so reloading the page or a server restart can't reset it) ----
 // Counts links read per user per UTC day. Set AI_DAILY_LIMIT on Render to change it.
 const AI_DAILY_LIMIT = Math.max(1, parseInt(process.env.AI_DAILY_LIMIT, 10) || 200);
@@ -259,14 +294,17 @@ app.post('/api/link-info', requireAuth, wrap(async (req, res) => {
   if (!url) return res.status(400).json({ error: 'That doesn\u2019t look like a web link' });
   const ai = await getAi();
   if (!ai) return res.status(503).json({ code: 'unavailable', error: 'Link auto-fill isn\u2019t set up on the server yet' });
+  if (geminiBreaker.isOpen()) return res.json({ ok: false, reason: 'error', hint: 'paused' });
   if (!(await aiConsume(req.userId, 1))) return limitReply(res, 'Today\u2019s auto-fill limit is reached. It resets at midnight UTC.');
   try {
-    const [data] = await linkInfo.analyzeLinks({ ai, models: GEMINI_MODELS, urls: [url], existingTopics: cleanTopicNames(req.body.existingTopics) });
+    const [data] = await modelHealer.run((models) => linkInfo.analyzeLinks({ ai, models, urls: [url], existingTopics: cleanTopicNames(req.body.existingTopics) }));
+    geminiBreaker.success();
     if (!data) return res.json({ ok: false, reason: 'unreadable' });
     res.json({ ok: true, data });
   } catch (e) {
     await aiRefund(req.userId, 1);
     if (isGeminiLimit(e)) return limitReply(res, 'Gemini\u2019s limit was reached for now. Try again later.');
+    geminiBreaker.failure();
     console.error('link-info failed:', e && e.status, e && e.message);
     res.json({ ok: false, reason: 'error', hint: linkInfo.describeError(e) });
   }
@@ -279,19 +317,24 @@ app.post('/api/link-info/batch', requireAuth, wrap(async (req, res) => {
   if (!urls.length || urls.length > 10 || urls.some((u) => !u)) return res.status(400).json({ error: 'Send between 1 and 10 valid web links' });
   const ai = await getAi();
   if (!ai) return res.status(503).json({ code: 'unavailable', error: 'Link auto-fill isn\u2019t set up on the server yet' });
+  if (geminiBreaker.isOpen()) return res.json({ ok: false, reason: 'error', hint: 'paused' });
   if (!(await aiConsume(req.userId, urls.length))) return limitReply(res, 'Today\u2019s auto-fill limit is reached. It resets at midnight UTC.');
   try {
-    const results = await linkInfo.analyzeLinks({ ai, models: GEMINI_MODELS, urls, existingTopics: cleanTopicNames(req.body.existingTopics) });
+    const results = await modelHealer.run((models) => linkInfo.analyzeLinks({ ai, models, urls, existingTopics: cleanTopicNames(req.body.existingTopics) }));
+    geminiBreaker.success();
     const unreadable = results.filter((r) => !r).length;
     if (unreadable) await aiRefund(req.userId, unreadable); // pages Gemini couldn't read don't use up the allowance
     res.json({ ok: true, results: results.map((data, i) => (data ? { url: rawUrls[i], ok: true, data } : { url: rawUrls[i], ok: false })) });
   } catch (e) {
     await aiRefund(req.userId, urls.length);
     if (isGeminiLimit(e)) return limitReply(res, 'Gemini\u2019s limit was reached for now. Try again later.');
+    geminiBreaker.failure();
     console.error('link-info batch failed:', e && e.status, e && e.message);
     res.json({ ok: false, reason: 'error', hint: linkInfo.describeError(e) });
   }
 }));
 
 const port = process.env.PORT || 3001;
-ensureSchema().then(() => app.listen(port, () => console.log(`Sortagram sync server on :${port}`)));
+// Listen straight away (so Render sees a healthy service and /health works) and finish database setup in the background.
+app.listen(port, () => console.log(`Sortagram sync server on :${port}`));
+ensureSchemaWithRetry();
