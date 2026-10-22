@@ -73,6 +73,8 @@ function sanitize(raw, existingTopics) {
 }
 
 const isRateLimit = (e) => e && (e.status === 429 || /\b429\b|RESOURCE_EXHAUSTED/.test(String(e.message || '')));
+// Google answers 503 "high demand" when a model is overloaded. That is temporary and model-specific, so the next model is worth trying.
+const isOverloaded = (e) => !!e && (e.status === 503 || /\b503\b|UNAVAILABLE|high demand|overloaded/i.test(String(e.message || '')));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function withTimeout(promise, ms) {
@@ -85,7 +87,7 @@ async function generate(ai, model, contents, config, opts) {
   for (let attempt = 0; ; attempt++) {
     try { return await withTimeout(ai.models.generateContent({ model, contents, config }), opts.timeoutMs); }
     catch (e) {
-      if (isRateLimit(e) && attempt < 1) { await sleep(opts.retryDelayMs); continue; }
+      if ((isRateLimit(e) || isOverloaded(e)) && attempt < 1) { await sleep(opts.retryDelayMs); continue; }
       throw e;
     }
   }
@@ -107,7 +109,7 @@ async function analyzeLink({ ai, model, url, existingTopics = [], timeoutMs = 25
       const data = sanitize(parseJson(resp && resp.text), existingTopics);
       if (data) return data;
     } catch (e) {
-      if (isRateLimit(e)) throw e;
+      if (isRateLimit(e) || isOverloaded(e)) throw e;
       lastErr = e;
     }
   }
@@ -122,7 +124,7 @@ async function analyzeWithModels({ models, ...rest }) {
   let last = null;
   for (const model of models) {
     try { return await analyzeLink({ ...rest, model }); }
-    catch (e) { if (isModelGone(e)) { last = e; continue; } throw e; }
+    catch (e) { if (isModelGone(e) || isOverloaded(e)) { last = e; continue; } throw e; }
   }
   throw last || new Error('No Gemini model configured');
 }
@@ -130,7 +132,7 @@ async function analyzeWithModels({ models, ...rest }) {
 // Short, safe category for the app to explain what went wrong (never includes secrets).
 function describeError(e) {
   const msg = String((e && e.message) || '');
-  if (isRateLimit(e)) return 'busy';
+  if (isRateLimit(e) || isOverloaded(e)) return 'busy';
   if (isModelGone(e)) return 'model';
   if (e && (e.status === 401 || e.status === 403) || /API key|API_KEY_INVALID|PERMISSION_DENIED|UNAUTHENTICATED/i.test(msg)) return 'key';
   if (/timed out/i.test(msg)) return 'timeout';
@@ -206,7 +208,7 @@ async function analyzeBatch({ ai, model, urls, existingTopics = [], timeoutMs = 
       const raw = parseJsonArray(resp && resp.text);
       if (raw) return matchBatch(raw, urls, existingTopics);
     } catch (e) {
-      if (isRateLimit(e)) throw e;
+      if (isRateLimit(e) || isOverloaded(e)) throw e;
       lastErr = e;
     }
   }
@@ -218,7 +220,7 @@ async function analyzeBatchWithModels({ models, ...rest }) {
   let last = null;
   for (const model of models) {
     try { return await analyzeBatch({ ...rest, model }); }
-    catch (e) { if (isModelGone(e)) { last = e; continue; } throw e; }
+    catch (e) { if (isModelGone(e) || isOverloaded(e)) { last = e; continue; } throw e; }
   }
   throw last || new Error('No Gemini model configured');
 }
@@ -284,7 +286,7 @@ async function analyzeMetaBatch({ ai, model, items, existingTopics = [], timeout
       raw = parseJsonArray(resp && resp.text);
       if (raw) break;
     } catch (e) {
-      if (isRateLimit(e)) throw e;
+      if (isRateLimit(e) || isOverloaded(e)) throw e;
       lastErr = e;
     }
   }
@@ -305,7 +307,7 @@ async function withModels(models, fn) {
   let last = null;
   for (const model of models) {
     try { return await fn(model); }
-    catch (e) { if (isModelGone(e)) { last = e; continue; } throw e; }
+    catch (e) { if (isModelGone(e) || isOverloaded(e)) { last = e; continue; } throw e; }
   }
   throw last || new Error('No Gemini model configured');
 }
@@ -349,5 +351,5 @@ async function discoverFlashModels(ai) {
 module.exports = {
   discoverFlashModels, analyzeLinks, fetchOEmbed, oembedEndpoint, analyzeMetaBatch,
   analyzeBatchWithModels, analyzeBatch, matchBatch, parseJsonArray, buildBatchPrompt,
-  analyzeWithModels, describeError, isModelGone, analyzeLink, validateUrl, sanitize, parseJson, buildPrompt
+  analyzeWithModels, describeError, isModelGone, isOverloaded, analyzeLink, validateUrl, sanitize, parseJson, buildPrompt
 };

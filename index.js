@@ -46,7 +46,9 @@ async function ensureSchema() {
     `ALTER TABLE topics ALTER COLUMN color DROP NOT NULL`,
     `ALTER TABLE topics ALTER COLUMN sort_order DROP NOT NULL`,
     `CREATE TABLE IF NOT EXISTS ai_usage (
-       user_id INTEGER NOT NULL, day DATE NOT NULL, n INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (user_id, day))`,
+       user_id TEXT NOT NULL, day DATE NOT NULL, n INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (user_id, day))`,
+    // Existing databases have user ids that are UUIDs, so an INTEGER column rejected every usage count. TEXT fits both kinds.
+    `ALTER TABLE ai_usage ALTER COLUMN user_id TYPE TEXT USING user_id::text`,
     `CREATE INDEX IF NOT EXISTS topics_user_sync ON topics (user_id, server_updated_at)`,
     `CREATE INDEX IF NOT EXISTS items_user_sync ON items (user_id, server_updated_at)`
   ];
